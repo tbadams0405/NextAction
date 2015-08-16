@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import argparse
 import copy
 import dateutil.parser
 import dateutil.tz
@@ -10,8 +11,8 @@ import time
 import urllib
 import urllib2
 
-API_TOKEN = 'YOUR_API_TOKEN_HERE'
 NEXT_ACTION_LABEL = u'next_action'
+args = None
 
 class TraversalState(object):
   """Simple class to contain the state of the item tree traversal."""
@@ -66,18 +67,24 @@ class Item(object):
       self._ParallelItemMods(state)
     if not state.found_next_action and not self.checked:
       state.found_next_action = True
-      if not state.next_action_label_id in self.labels:
+      if args.use_priority and self.priority != 4:
         state.add_labels.append(self)
-    elif state.next_action_label_id in self.labels:
-      state.remove_labels.append(self)
+      elif not args.use_priority and not state.next_action_label_id in self.labels:
+        state.add_labels.append(self)
+    else:
+      if args.use_priority and self.priority == 4:
+        state.remove_labels.append(self)
+      elif not args.use_priority and state.next_action_label_id in self.labels:
+        state.remove_labels.append(self)
 
   def SortChildren(self):
-    sortfunc = lambda item: [item.due_date_utc, (5 - item.priority)]
-    self.children = sorted(self.children, key=sortfunc)
-    for item in self.children:
-      item.SortChildren()
+    # Sorting by priority and date seemed like a good idea at some point, but
+    # that has proven wrong. Don't sort.
+    pass
 
   def GetLabelRemovalMods(self, state):
+    if args.use_priority:
+      return
     if state.next_action_label_id in self.labels:
       state.remove_labels.append(self)
     for item in self.children:
@@ -105,31 +112,24 @@ class Item(object):
 
   def IsSequential(self):
     return not self.content.endswith('=')
-    #if self.content.endswith('--') or self.content.endswith('='):
-    #  return self.content.endswith('--')
-    #else:
-    #  return self.parent.IsSequential()
 
   def IsParallel(self):
     return self.content.endswith('=')
-    #if self.content.endswith('--') or self.content.endswith('='):
-    #  return self.content.endswith('=')
-    #else:
-    #  return self.parent.IsParallel()
 
 class Project(object):
   def __init__(self, initial_data):
+    self.unsorted_items = dict()
     self.children = []
     self.indent = 0
     self.is_archived = initial_data['is_archived'] == 1
     self.is_deleted = initial_data['is_deleted'] == 1
-    self.last_updated = initial_data['last_updated']
     self.name = initial_data['name']
     # Project should act like an item, so it should have content.
     self.content = initial_data['name']
     self.project_id = initial_data['id']
-    self._CreateItemTree(initial_data['items'])
-    self.SortChildren()
+
+  def UpdateChangedData(self, changed_data):
+    self.name = changed_data['name']
 
   def IsSequential(self):
     return self.name.endswith('--')
@@ -153,11 +153,29 @@ class Project(object):
       for item in self.children:
         item.GetLabelRemovalMods(state)
 
-  def _CreateItemTree(self, items):
-    '''Build a tree of items based on their indentation level.'''
+  def AddItem(self, item):
+    '''Collect unsorted child items
+
+    All child items for all projects are bundled up into an 'Items' list in the
+    v5 api. They must be normalized and then sorted to make use of them.'''
+    self.unsorted_items[item['id']] = item
+
+  def DelItem(self, item):
+    '''Delete unsorted child items'''
+    del self.unsorted_items[item['id']]
+
+
+  def BuildItemTree(self):
+    '''Build a tree of items build off the unsorted list
+
+    Sort the unsorted children first so that indentation levels mean something.
+    '''
+    self.children = []
+    sortfunc = lambda item: item['item_order']
+    sorted_items = sorted(self.unsorted_items.values(), key=sortfunc)
     parent_item = self
     previous_item = self
-    for item_dict in items:
+    for item_dict in sorted_items:
       item = Item(item_dict)
       if item.indent > previous_item.indent:
         logging.debug('pushing "%s" on the parent stack beneath "%s"',
@@ -174,21 +192,32 @@ class Project(object):
       parent_item.children.append(item)
       item.parent = parent_item
       previous_item = item
+    #self.SortChildren()
 
 
 class TodoistData(object):
   '''Construct an object based on a full Todoist /Get request's data'''
   def __init__(self, initial_data):
 
+    self._next_action_id = None
     self._SetLabelData(initial_data)
     self._projects = dict()
+    self._seq_no = initial_data['seq_no']
     for project in initial_data['Projects']:
-      self._projects[project['id']] = Project(project)
+      if project['is_deleted'] == 0:
+        self._projects[project['id']] = Project(project)
+    for item in initial_data['Items']:
+      self._projects[item['project_id']].AddItem(item)
+    for project in self._projects.itervalues():
+      project.BuildItemTree()
 
   def _SetLabelData(self, label_data):
+    if args.use_priority:
+      return
+    if 'Labels' not in label_data:
+      logging.debug("Label data not found, wasn't updated.")
+      return
     # Store label data - we need this to set the next_action label.
-    self._labels_timestamp = label_data['LabelsTimestamp']
-    self._next_action_id = None
     for label in label_data['Labels']:
       if label['name'] == NEXT_ACTION_LABEL:
         self._next_action_id = label['id']
@@ -197,49 +226,40 @@ class TodoistData(object):
         logging.warning('Failed to find next_action label, need to create it.')
 
   def GetSyncState(self):
-    project_timestamps = dict()
-    for project_id, project in self._projects.iteritems():
-      project_timestamps[project_id] = project.last_updated
-    return {'labels_timestamp': self._labels_timestamp,
-            'project_timestamps': project_timestamps}
+    return {'seq_no': self._seq_no}
 
   def UpdateChangedData(self, changed_data):
-    if ('LabelsTimestamp' in changed_data
-        and changed_data['LabelsTimestamp'] != self._labels_timestamp):
-      self._SetLabelData(changed_data)
-    # delete missing projects
-    if 'ActiveProjectIds' in changed_data:
-      projects_to_delete = set(self._projects.keys()) - set(changed_data['ActiveProjectIds']) 
-      for project_id in projects_to_delete:
-        logging.info("Forgetting deleted project %s", self._projects[project_id].name)
-        del self._projects[project_id]
+    if 'seq_no' in changed_data:
+      self._seq_no = changed_data['seq_no']
+    if 'TempIdMapping' in changed_data:
+      if self._next_action_id in changed_data['TempIdMapping']:
+        logging.info('Discovered temp->real next_action mapping ID')
+        self._next_action_id = changed_data['TempIdMapping'][self._next_action_id]
     if 'Projects' in changed_data:
       for project in changed_data['Projects']:
-        logging.info("Refreshing data for project %s", project['name'])
+	# delete missing projects
+        if project['is_deleted'] == 1:
+          logging.info('forgetting deleted project %s' % project['name'])
+          del self._projects[project['project_id']]
         if project['id'] in self._projects:
-          logging.info("replacing project data, old timestamp: %s new timestamp: %s",
-              self._projects[project['id']].last_updated, project['last_updated'])
-        self._projects[project['id']] = Project(project)
-    # We have already reloaded project data sent to us.
-    # Now any project timestamps that have changed are due to the changes we
-    # just sent to the server. Let's update our model.
-    if 'ActiveProjectTimestamps' in changed_data:
-      for project_id, timestamp in changed_data['ActiveProjectTimestamps'].iteritems():
-        # for some reason the project id is a string and not an int here.
-        project_id = int(project_id)
-        if project_id in self._projects:
-          project = self._projects[project_id]
-          if project.last_updated != timestamp:
-            logging.info("Updating timestamp for project %s to %s",
-                project.name, timestamp)
-            project.last_updated = timestamp
-
-
-
+          self._projects[project['id']].UpdateChangedData(project)
+        else :
+          logging.info('found new project: %s' % project['name'])
+          self._projects[project['id']] = Project(project)
+    if 'Items' in changed_data:
+      for item in changed_data['Items']:
+        if item['is_deleted'] == 1:
+          logging.info('removing deleted item %d from project %d' % (item['id'], item['project_id']))
+          self._projects[item['project_id']].DelItem(item)
+        else:
+          self._projects[item['project_id']].AddItem(item)
+    for project in self._projects.itervalues():
+      project.BuildItemTree()
+    
   def GetProjectMods(self):
     mods = []
     # We need to create the next_action label
-    if self._next_action_id == None:
+    if self._next_action_id == None and not args.use_priority:
       self._next_action_id = '$%d' % int(time.time())
       mods.append({'type': 'label_register',
                    'timestamp': int(time.time()),
@@ -263,57 +283,78 @@ class TodoistData(object):
         # Intentionally add the next_action label to the item.
         # This prevents us from applying the label twice since the sync
         # interface does not return our changes back to us on GetAndSync.
-        item.labels.append(self._next_action_id)
-        mods.append({'type': 'item_update',
-                     'timestamp': int(time.time()),
-                     'args': {
-                       'id': item.item_id,
-                       'labels': item.labels
-                      }})
+        # Apply these changes to both the item in the tree and the unsorted
+        # data.
+        # I really don't like this aspect of the API - return me a full copy of
+        # changed items please.
+        #
+        # Also... OMFG. "Priority 1" in the UI is actually priority 4 via the API.
+        # Lowest priority = 1 here, but that is the word for highest priority
+        # on the website.
+        m = self.MakeNewMod(item)
+        mods.append(m)
+        if args.use_priority:
+          item.priority = 4
+          project.unsorted_items[item.item_id]['priority'] = 4
+          m['args']['priority'] = item.priority
+        else:
+          item.labels.append(self._next_action_id)
+          m['args']['labels'] = item.labels
         logging.info("add next_action to: %s", item.content)
       for item in state.remove_labels:
-        item.labels.remove(self._next_action_id)
-        mods.append({'type': 'item_update',
-                     'timestamp': int(time.time()),
-                     'args': {
-                       'id': item.item_id,
-                       'labels': item.labels
-                      }})
+        m = self.MakeNewMod(item)
+        mods.append(m)
+        if args.use_priority:
+          item.priority = 1
+          project.unsorted_items[item.item_id]['priority'] = 1
+          m['args']['priority'] = item.priority
+        else:
+          item.labels.remove(self._next_action_id)
+          m['args']['labels'] = item.labels
         logging.info("remove next_action from: %s", item.content)
     return mods
 
+  @staticmethod
+  def MakeNewMod(item):
+    return {'type': 'item_update',
+            'timestamp': int(time.time()),
+            'args': {
+              'id': item.item_id,
+              }
+            }
 
 
-def GetResponse():
-  values = {'api_token': API_TOKEN}
+
+
+def GetResponse(api_token):
+  values = {'api_token': api_token, 'seq_no': '0'}
   data = urllib.urlencode(values)
-  req = urllib2.Request('https://api.todoist.com/TodoistSync/v2/get', data)
+  req = urllib2.Request('https://api.todoist.com/TodoistSync/v5.3/get', data)
   return urllib2.urlopen(req)
 
-def DoSync(items_to_sync):
-  values = {'api_token': API_TOKEN,
-            'items_to_sync': json.dumps(items_to_sync)}
-  logging.info("posting %s", values)
-  data = urllib.urlencode(values)
-  req = urllib2.Request('https://api.todoist.com/TodoistSync/v2/sync', data)
-  return urllib2.urlopen(req)
-
-def DoSyncAndGetUpdated(items_to_sync, sync_state):
-  values = {'api_token': API_TOKEN,
+def DoSyncAndGetUpdated(api_token, items_to_sync, sync_state):
+  values = {'api_token': api_token,
             'items_to_sync': json.dumps(items_to_sync)}
   for key, value in sync_state.iteritems():
     values[key] = json.dumps(value)
   logging.debug("posting %s", values)
   data = urllib.urlencode(values)
-  req = urllib2.Request('https://api.todoist.com/TodoistSync/v2/syncAndGetUpdated', data)
+  req = urllib2.Request('https://api.todoist.com/TodoistSync/v5.3/syncAndGetUpdated', data)
   return urllib2.urlopen(req)
 
 def main():
-  logging.basicConfig(level=logging.INFO)
-  response = GetResponse()
-  json_data = json.loads(response.read())
-  logging.debug("Got initial data: %s", json_data)
-  a = TodoistData(json_data)
+  parser = argparse.ArgumentParser(description='Add NextAction labels to Todoist.')
+  parser.add_argument('--api_token', required=True, help='Your API key')
+  parser.add_argument('--use_priority', required=False,
+      action="store_true", help='Use priority 1 rather than a label to indicate the next actions.')
+  global args
+  args = parser.parse_args()
+  logging.basicConfig(level=logging.DEBUG)
+  response = GetResponse(args.api_token)
+  initial_data = response.read()
+  logging.debug("Got initial data: %s", initial_data)
+  initial_data = json.loads(initial_data)
+  a = TodoistData(initial_data)
   while True:
     mods = a.GetProjectMods()
     if len(mods) == 0:
@@ -322,7 +363,7 @@ def main():
       logging.info("* Modifications necessary - skipping sleep cycle.")
     logging.info("** Beginning sync")
     sync_state = a.GetSyncState()
-    changed_data = DoSyncAndGetUpdated(mods, sync_state).read()
+    changed_data = DoSyncAndGetUpdated(args.api_token,mods, sync_state).read()
     logging.debug("Got sync data %s", changed_data)
     changed_data = json.loads(changed_data)
     logging.info("* Updating model after receiving sync data")
